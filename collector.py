@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discover application-announcement leads for OPENPATH. Never approves or publishes leads."""
+"""Discover possible OPENPATH application leads. Never verifies or approves them."""
 import json
 import re
 import time
@@ -12,34 +12,44 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATA_FILE = ROOT / "opportunities.json"
 
-# Search for announcements, not broad discussion about opportunities.
+# Google News is used only to discover leads. Every lead must be checked manually.
 SEARCHES = [
-    ("Scholarship", 'Ghana scholarship "applications open" OR "call for applications"'),
-    ("Scholarship", 'Ghana students scholarship "apply now" OR "application deadline"'),
-    ("International scholarship", 'Ghanaian students scholarship "applications open"'),
-    ("International scholarship", 'Commonwealth Shared Scholarship "apply" 2027'),
-    ("International scholarship", 'Erasmus Mundus scholarship "applications" 2027'),
-    ("International scholarship", 'DAAD Ghana scholarship "application" 2027'),
-    ("International scholarship", 'Fulbright Ghana "application" student 2027'),
-    ("Internship", 'Ghana internship "applications open" OR "apply now"'),
-    ("Job", 'Ghana graduate trainee "apply now" OR "applications open"'),
-    ("Job", 'Ghana entry level vacancy "application deadline"'),
-    ("Free course", 'free online course "enrol now" OR "registration open" certificate'),
+    ("Scholarship", 'Ghana scholarship ("applications open" OR "call for applications" OR "apply now")'),
+    ("Scholarship", 'Ghana students scholarship ("application deadline" OR "now accepting applications")'),
+    ("International scholarship", 'Ghanaian students international scholarship ("applications open" OR "apply now")'),
+    ("International scholarship", 'Commonwealth scholarship 2027 ("applications open" OR "apply now")'),
+    ("International scholarship", 'Erasmus Mundus 2027 scholarship ("applications open" OR "apply now")'),
+    ("International scholarship", 'DAAD scholarship Ghana ("applications open" OR "apply now")'),
+    ("International scholarship", 'Fulbright Ghana scholarship ("applications open" OR "apply now")'),
+    ("Internship", 'Ghana internship ("applications open" OR "apply now" OR "apply by")'),
+    ("Job", 'Ghana graduate trainee ("applications open" OR "apply now" OR "apply by")'),
+    ("Job", 'Ghana entry level jobs ("applications open" OR "apply now" OR "application deadline")'),
+    ("Free course", 'free online course ("enrol now" OR "enroll now" OR "registration open") certificate'),
 ]
 
-POSITIVE = re.compile(
-    r"\b(applications? (?:are )?open|call for applications|apply now|now accepting applications|"
-    r"accepting applications|application deadline|applications close|apply by|register now|"
-    r"registration open|enrol now|enroll now|submit applications)\b", re.I
+ACTION = re.compile(
+    r"\b(?:applications?\s+(?:are\s+)?open|call\s+for\s+applications?|"
+    r"apply\s+now|now\s+accepting\s+applications?|accepting\s+applications?|"
+    r"application\s+deadline|applications?\s+close|apply\s+by|register\s+now|"
+    r"registration\s+open|enrol\s+now|enroll\s+now|submit\s+applications?)\b", re.I
 )
-NEGATIVE = re.compile(
-    r"\b(guide|explained|what you need to know|how to apply|eligibility and|"
-    r"crisis|opinion|editorial|analysis|top \d+|\d+ opportunities|list of|"
-    r"best scholarships|scholarship tips|everything you need)\b", re.I
+
+# Reject titles that are clearly explanatory, retrospective, or list-style.
+REJECT = re.compile(
+    r"\b(?:guide|explained|what\s+you\s+need\s+to\s+know|how\s+to\s+apply|"
+    r"eligibility\s+and|opinion|editorial|analysis|review|recap|"
+    r"top\s+\d+|\d+\s+(?:best\s+)?opportunities|list\s+of|"
+    r"best\s+scholarships|scholarship\s+tips|everything\s+you\s+need|"
+    r"what\s+is|all\s+you\s+need\s+to\s+know)\b", re.I
 )
-GENERIC_PUBLISHERS = {
-    "google news", "news source", "yahoo", "msn", "pulse", "graphic online",
-    "citinewsroom", "bbc", "cnn", "the guardian", "ghanaweb", "modern ghana",
+
+# A matching action phrase alone is not enough; the headline must also match its category.
+CATEGORY_TERMS = {
+    "Scholarship": re.compile(r"\b(scholarship|scholarships|bursary|bursaries|grant|grants)\b", re.I),
+    "International scholarship": re.compile(r"\b(scholarship|scholarships|fellowship|fellowships|bursary|grant)\b", re.I),
+    "Internship": re.compile(r"\b(internship|internships|intern|interns)\b", re.I),
+    "Job": re.compile(r"\b(job|jobs|vacanc(?:y|ies)|graduate trainee|trainee programme|recruitment|hiring)\b", re.I),
+    "Free course": re.compile(r"\b(course|courses|training|certificate|certification|enrol|enroll)\b", re.I),
 }
 
 
@@ -52,17 +62,17 @@ def load_existing():
         return []
     try:
         data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            raise RuntimeError("opportunities.json must contain a JSON list.")
+        return data
     except (json.JSONDecodeError, OSError) as exc:
         raise RuntimeError(f"Could not safely read {DATA_FILE.name}: {exc}") from exc
 
 
 def resolve_article_url(url):
-    """Try to follow the Google News redirect; fall back to its RSS URL."""
+    """Try to resolve a Google News redirect; otherwise retain its RSS URL."""
     try:
-        request = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 OPENPATH-opportunity-discovery/2.0"}
-        )
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 OPENPATH/3.0"})
         with urllib.request.urlopen(request, timeout=12) as response:
             final_url = response.geturl()
         if urllib.parse.urlparse(final_url).scheme in {"http", "https"}:
@@ -72,81 +82,15 @@ def resolve_article_url(url):
     return url
 
 
-def looks_like_application_announcement(title):
-    if not POSITIVE.search(title):
+def is_relevant_lead(category, title):
+    title = clean(title)
+    if not title or not ACTION.search(title) or REJECT.search(title):
         return False
-    if NEGATIVE.search(title):
-        return False
-    return True
+    category_pattern = CATEGORY_TERMS.get(category)
+    return bool(category_pattern and category_pattern.search(title))
 
 
 def fetch_feed(category, query):
     params = urllib.parse.urlencode({"q": query, "hl": "en-GH", "gl": "GH", "ceid": "GH:en"})
     feed_url = "https://news.google.com/rss/search?" + params
-    request = urllib.request.Request(
-        feed_url, headers={"User-Agent": "OPENPATH-opportunity-discovery/2.0"}
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=25) as response:
-            root = ET.fromstring(response.read())
-    except Exception as exc:
-        print(f"Feed failed for {query!r}: {exc}")
-        return []
-
-    leads = []
-    for item in root.findall(".//item")[:15]:
-        title = clean(item.findtext("title"))
-        rss_link = clean(item.findtext("link"))
-        published = clean(item.findtext("pubDate"))
-        source_node = item.find("source")
-        publisher = clean(source_node.text if source_node is not None else "Unknown publisher")
-        publisher_url = clean(source_node.get("url", "")) if source_node is not None else ""
-
-        if not title or not rss_link or not looks_like_application_announcement(title):
-            continue
-
-        article_url = resolve_article_url(rss_link)
-        leads.append({
-            "type": category,
-            "title": title,
-            "org": "Verify from official provider",
-            "where": "Ghana / International — eligibility not yet verified",
-            "detail": (
-                "UNVERIFIED DISCOVERY LEAD. A headline matched application-announcement terms. "
-                "Confirm the opportunity on the provider's official website, including eligibility, "
-                "requirements, funding, deadline and direct application link before approval."
-            ),
-            "deadline": "Not verified — check official provider",
-            "url": article_url,
-            "source_url": article_url,
-            "source_publisher": publisher,
-            "publisher_url": publisher_url,
-            "source_published": published,
-            "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "review_note": "Headline filter only; publisher is not assumed to be the opportunity provider.",
-            "status": "pending",
-        })
-    return leads
-
-
-def main():
-    existing = load_existing()
-    seen = {clean(x.get("source_url") or x.get("url")) for x in existing if isinstance(x, dict)}
-    added = 0
-    for category, query in SEARCHES:
-        for lead in fetch_feed(category, query):
-            key = clean(lead["source_url"])
-            if key in seen:
-                continue
-            existing.append(lead)
-            seen.add(key)
-            added += 1
-        time.sleep(1)
-
-    DATA_FILE.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"OPENPATH discovery complete: {added} new filtered pending leads; {len(existing)} total records.")
-    print("All new leads remain pending. Headline filtering is not verification; manually check official providers before approval.")
-
-
-if __name__ == "__main__":
-    main()
+    request = urllib.request.Request(feed_url, headers={"User-Agent": "OPENPATH-discovery/3.0"})
